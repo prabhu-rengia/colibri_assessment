@@ -11,7 +11,7 @@ Medallion architecture, one file per table:
 
 ```
 transformations/
-  bronze/turbine_raw.py        Auto Loader ingest of the raw CSVs, as-is
+  bronze/turbine_raw.py        Auto Loader ingest of the raw CSVs, CDC-merged
   silver/turbine_cleaned.py    dedup, missing-value imputation, outlier removal
   gold/turbine_daily_stats.py  per-turbine, per-day min/max/avg/stddev
   gold/turbine_anomalies.py    per-turbine, per-day anomaly flag
@@ -29,14 +29,31 @@ pipeline glue:
 - `clean_turbine_data(raw_df)`, `compute_daily_stats(cleaned_df)`,
   `detect_anomalies(daily_stats_df)` are plain functions of a DataFrame to a
   DataFrame - no dependency on Databricks-only APIs.
-- The `@dp.materialized_view` / `@dp.table`-decorated function in each file
-  is a thin entry point: it reads the upstream table and calls the pure
+- The `@dp.materialized_view`-decorated function in each Silver/Gold file is
+  a thin entry point: it reads the upstream table and calls the pure
   function. That's the only part of each file (besides bronze, which is
   pure I/O) that can't be exercised outside a Databricks pipeline runtime.
 
 This split is what makes the pipeline testable: `tests/` runs the pure
 functions against a local PySpark session and the sample CSVs, with no
 Databricks connection required.
+
+### Ingestion (Bronze)
+
+Auto Loader streams the raw CSVs in, but doesn't write them straight to the
+bronze table with a plain append. Instead, `create_auto_cdc_flow` merges
+the stream into the target table, upserting on `(turbine_id, timestamp)`
+(see Assumptions below for why a plain streaming append doesn't fit this
+source's update pattern). That keeps bronze exactly in sync with the
+source CSVs' current contents, however many times a file gets reprocessed.
+
+This fixes *storage*, not *compute*: `allowOverwrites` still makes Auto
+Loader re-read and re-emit a changed file's full current contents on every
+change (CSV can't be read incrementally by offset), so the merge's input
+volume still grows the same way bronze storage used to - the CDC upsert
+just discards the resulting duplicates on write instead of persisting them.
+Acceptable at this data volume; would need revisiting for large per-file
+sizes.
 
 ### Cleaning (Silver)
 
@@ -88,9 +105,21 @@ detectable anomaly rather than raising a division-by-zero error.
   same file grows over time rather than a new file landing each day. Auto
   Loader's default file-discovery mode reads a given file once, so bronze
   sets `cloudFiles.allowOverwrites = "true"` to detect and reprocess
-  modified files. That means bronze can re-emit rows it has already
-  ingested; the Silver-layer dedup on `(timestamp, turbine_id)` is what
-  makes that safe.
+  modified files. CSV has no byte-offset resume point, so that reprocessing
+  re-emits every row already in the file, not just the newly appended ones
+  - a plain append into bronze (`@dp.table`) would therefore make bronze
+  grow by the *cumulative* size of every daily snapshot (e.g. a 100-row
+  file that grows to 210 then 230 rows would leave bronze holding
+  100 + 210 + 230 = 540 rows, not 230). To avoid that, bronze uses
+  `create_auto_cdc_flow` to merge the stream into the target table keyed on
+  `(turbine_id, timestamp)` instead: re-emitted rows upsert in place rather
+  than piling up, so bronze always matches the source's current row count.
+  The Silver-layer dedup on `(timestamp, turbine_id)` is kept regardless, as
+  a cheap safeguard against duplicate rows from any source, not just this
+  one.
+- **The pipeline is triggered (not continuous) and runs on a schedule that
+  follows each day's CSV update** (e.g. a daily Databricks Job). Bronze
+  reflects the source only as of the last pipeline run, not in real time.
 - **Turbine IDs map 1:1 to a fixed CSV file** (`turbine 1` always in
   `data_group_1.csv`, etc.), per the brief - no cross-file join or
   reconciliation is needed to resolve a turbine's identity.
@@ -109,10 +138,11 @@ detectable anomaly rather than raising a division-by-zero error.
 
 - No Databricks Asset Bundle / pipeline deployment config (`databricks.yml`)
   is included yet - this repo currently defines the transformations only.
-- Bronze (`turbine_raw.py`) is a thin Auto Loader I/O wrapper and isn't
-  covered by the local test suite, since Auto Loader itself only runs
-  inside a Databricks pipeline; it's exercised implicitly by whatever
-  integration/staging environment the pipeline is deployed to.
+- Bronze (`turbine_raw.py`) is a thin Auto Loader + CDC-merge I/O wrapper
+  and isn't covered by the local test suite, since Auto Loader and
+  `create_auto_cdc_flow` only run inside a Databricks pipeline; it's
+  exercised implicitly by whatever integration/staging environment the
+  pipeline is deployed to.
 
 ## Running the tests
 

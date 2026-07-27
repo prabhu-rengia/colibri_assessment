@@ -1,68 +1,62 @@
 from pyspark import pipelines as dp
-from pyspark.sql import functions as F
+from pyspark.sql import functions as F, DataFrame
 from pyspark.sql.window import Window
 
-@dp.materialized_view(
-    name="colibri_assessment.gold.turbine_anomalies",
-    comment="Anomaly detection for wind turbine power output using rolling 7-day baseline",
-    table_properties={"quality": "gold"},
-    cluster_by=["turbine_id", "date"]
-)
-def turbine_anomalies():
+
+def detect_anomalies(daily_stats_df: DataFrame) -> DataFrame:
     """
-    Gold layer: Anomaly detection for turbine power output.
-    
-    Logic:
-    - Calculate rolling 7-day baseline (mean and stddev) per turbine
-    - Flag days where avg power output is > 2 std deviations from baseline
-    - Provide context: expected range, actual power, anomaly score
+    Gold layer transformation: anomaly detection for turbine power output.
+
+    Per the assignment spec, a turbine is anomalous when its output is
+    outside 2 standard deviations from the mean "over the same time
+    period" - i.e. compared against its peers on that same day, not
+    against its own historical baseline. All turbines on the farm see
+    broadly the same wind conditions, so for each date we compute the
+    fleet's mean and standard deviation of avg_power_mw across all
+    turbines that reported that day, and flag any turbine whose daily
+    average falls outside mean +/- 2*stddev. This also means a turbine can
+    be flagged from day one, with no rolling history required.
+
+    Pure function of a gold daily-stats-shaped DataFrame so it can be unit
+    tested directly.
     """
-    # Read daily stats from Gold layer
-    df = spark.read.table("colibri_assessment.gold.turbine_daily_stats")
-    
-    # Define rolling 7-day window (excluding current day to establish baseline)
-    window_spec = (
-        Window.partitionBy("turbine_id")
-        .orderBy("date")
-        .rowsBetween(-7, -1)  # Previous 7 days only
-    )
-    
-    # Calculate rolling baseline statistics
-    df = df.withColumn("baseline_mean_power", F.avg("avg_power_mw").over(window_spec))
-    df = df.withColumn("baseline_stddev_power", F.stddev("avg_power_mw").over(window_spec))
-    
-    # Calculate expected range (mean ± 2 std deviations)
+    same_day = Window.partitionBy("date")
+
+    df = daily_stats_df.withColumn("fleet_mean_power", F.avg("avg_power_mw").over(same_day))
+    df = df.withColumn("fleet_stddev_power", F.stddev("avg_power_mw").over(same_day))
+
     df = df.withColumn("expected_range_lower",
-        F.col("baseline_mean_power") - 2 * F.col("baseline_stddev_power"))
+        F.col("fleet_mean_power") - 2 * F.col("fleet_stddev_power"))
     df = df.withColumn("expected_range_upper",
-        F.col("baseline_mean_power") + 2 * F.col("baseline_stddev_power"))
-    
-    # Calculate anomaly score (how many std deviations from baseline)
+        F.col("fleet_mean_power") + 2 * F.col("fleet_stddev_power"))
+
+    # Std dev is null/0 when a day has a single turbine reading or all
+    # turbines report identical output - guard against div-by-zero and
+    # treat those days as having no detectable anomaly.
     df = df.withColumn("anomaly_score",
-        F.abs(F.col("avg_power_mw") - F.col("baseline_mean_power")) / 
-        F.coalesce(F.col("baseline_stddev_power"), F.lit(1.0))  # Avoid division by zero
+        F.when(F.coalesce(F.col("fleet_stddev_power"), F.lit(0.0)) > 0,
+            F.abs(F.col("avg_power_mw") - F.col("fleet_mean_power")) / F.col("fleet_stddev_power")
+        ).otherwise(F.lit(0.0))
     )
-    
-    # Flag anomalous days (> 2 std deviations)
+
     df = df.withColumn("is_anomalous",
-        (F.col("avg_power_mw") < F.col("expected_range_lower")) |
-        (F.col("avg_power_mw") > F.col("expected_range_upper"))
+        (F.coalesce(F.col("fleet_stddev_power"), F.lit(0.0)) > 0) &
+        ((F.col("avg_power_mw") < F.col("expected_range_lower")) |
+         (F.col("avg_power_mw") > F.col("expected_range_upper")))
     )
-    
-    # Add anomaly reason
+
     df = df.withColumn("anomaly_reason",
-        F.when(F.col("avg_power_mw") > F.col("expected_range_upper"), "Power output unusually HIGH")
-        .when(F.col("avg_power_mw") < F.col("expected_range_lower"), "Power output unusually LOW")
-        .otherwise("Normal operation")
+        F.when(~F.col("is_anomalous"), "Normal operation")
+        .when(F.col("avg_power_mw") > F.col("expected_range_upper"), "Power output unusually HIGH vs. fleet")
+        .otherwise("Power output unusually LOW vs. fleet")
     )
-    
-    # Select relevant columns
+
     result_df = df.select(
         "date",
         "turbine_id",
         "avg_power_mw",
-        "baseline_mean_power",
-        "baseline_stddev_power",
+        "fleet_mean_power",
+        "fleet_stddev_power",
         "expected_range_lower",
         "expected_range_upper",
         "anomaly_score",
@@ -71,8 +65,17 @@ def turbine_anomalies():
         "record_count",
         "avg_quality_score"
     )
-    
-    # Filter to only anomalous days (optional - comment out to keep all days)
-    # result_df = result_df.filter(F.col("is_anomalous"))
-    
+
     return result_df.orderBy("date", "turbine_id")
+
+
+@dp.materialized_view(
+    name="colibri_assessment.gold.turbine_anomalies",
+    comment="Anomaly detection for wind turbine power output vs. same-day fleet baseline",
+    table_properties={"quality": "gold"},
+    cluster_by=["turbine_id", "date"]
+)
+def turbine_anomalies():
+    """Gold layer: Databricks pipeline entry point, delegates to detect_anomalies."""
+    df = spark.read.table("colibri_assessment.gold.turbine_daily_stats")
+    return detect_anomalies(df)

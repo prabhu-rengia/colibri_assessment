@@ -70,6 +70,17 @@ sizes.
 - Each row gets a `quality_score` (1.0 = no imputation needed, 0.8 = one or
   both wind sensors imputed) that rolls up into the daily stats.
 
+### Audit timestamps
+
+Every layer's output table carries an `_ingestion_time` column, but each
+layer stamps its *own* value (`current_timestamp()` at that layer's
+transform) rather than propagating the value it read in - Silver overwrites
+the `_ingestion_time` it gets from Bronze, and Gold's two tables
+(`turbine_daily_stats`, `turbine_anomalies`) each set their own. That
+answers "when did this row/aggregate get produced by this layer," not just
+"when did the underlying reading first arrive." Bronze's original ingest
+time isn't lost - it's recorded once, in the Bronze table itself.
+
 ### Summary statistics (Gold)
 
 `turbine_daily_stats` aggregates the cleaned data to one row per

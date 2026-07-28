@@ -11,6 +11,10 @@ def compute_daily_stats(cleaned_df: DataFrame) -> DataFrame:
     - min / max / avg / stddev of power output
     - record count
     - data quality score (share of readings that needed no imputation)
+
+    Stamps _ingestion_time with the time this aggregate was computed by
+    Gold - an audit timestamp for this layer, independent of Silver's or
+    Bronze's.
     """
     stats_df = cleaned_df.groupBy("turbine_id", "date").agg(
         F.min("power_output").alias("min_power_mw"),
@@ -24,6 +28,8 @@ def compute_daily_stats(cleaned_df: DataFrame) -> DataFrame:
 
     stats_df = stats_df.withColumn("power_range_mw",
         F.col("max_power_mw") - F.col("min_power_mw"))
+
+    stats_df = stats_df.withColumn("_ingestion_time", F.current_timestamp())
 
     return stats_df.orderBy("date", "turbine_id")
 

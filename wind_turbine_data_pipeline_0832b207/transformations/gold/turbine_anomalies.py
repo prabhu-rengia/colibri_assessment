@@ -19,6 +19,9 @@ def detect_anomalies(daily_stats_df: DataFrame) -> DataFrame:
 
     Pure function of a gold daily-stats-shaped DataFrame so it can be unit
     tested directly.
+
+    Stamps _ingestion_time with the time this anomaly check was computed -
+    its own audit timestamp, independent of turbine_daily_stats's.
     """
     same_day = Window.partitionBy("date")
 
@@ -51,6 +54,8 @@ def detect_anomalies(daily_stats_df: DataFrame) -> DataFrame:
         .otherwise("Power output unusually LOW vs. fleet")
     )
 
+    df = df.withColumn("_ingestion_time", F.current_timestamp())
+
     result_df = df.select(
         "date",
         "turbine_id",
@@ -63,7 +68,8 @@ def detect_anomalies(daily_stats_df: DataFrame) -> DataFrame:
         "is_anomalous",
         "anomaly_reason",
         "record_count",
-        "avg_quality_score"
+        "avg_quality_score",
+        "_ingestion_time"
     )
 
     return result_df.orderBy("date", "turbine_id")

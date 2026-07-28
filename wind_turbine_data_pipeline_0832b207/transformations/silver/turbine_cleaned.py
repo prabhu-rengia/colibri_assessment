@@ -20,6 +20,9 @@ def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
       @dp.expect_or_drop, since there's no sound way to impute the primary
       measurement being reported on).
     - Remove power_output outliers using a per-turbine 3-sigma rule.
+    - Stamp _ingestion_time with the time this row was processed by Silver,
+      overwriting the value carried in from Bronze - each layer records its
+      own audit timestamp rather than propagating the original one.
     """
     df = raw_df.withColumn("timestamp", F.col("timestamp").cast("timestamp"))
     df = df.withColumn("date", F.to_date("timestamp"))
@@ -68,6 +71,9 @@ def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
         .when(F.col("missing_wind_speed") | F.col("missing_wind_direction"), 0.8)
         .otherwise(0.6)
     )
+
+    # Audit column: overwrite Bronze's _ingestion_time with Silver's own
+    df = df.withColumn("_ingestion_time", F.current_timestamp())
 
     # Select final columns
     return df.select(

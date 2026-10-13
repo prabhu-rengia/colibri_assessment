@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from transformations.silver.turbine_cleaned import clean_turbine_data
+from transformations.silver.turbine_cleaned import clean_turbine_data, extract_outliers
 
 
 def _bronze_row(ts, turbine_id, wind_speed, wind_direction, power_output):
@@ -85,6 +85,37 @@ def test_outlier_removal_is_scoped_per_turbine(spark):
         for h in range(5)
     ]
 
-    df = clean_turbine_data(_make_bronze_df(spark, rows))
+    bronze = _make_bronze_df(spark, rows)
 
-    assert df.count() == 10
+    assert clean_turbine_data(bronze).count() == 10
+    assert extract_outliers(bronze).count() == 0
+
+
+def test_outliers_are_stored_with_the_stats_they_were_judged_against(spark):
+    rows = [
+        _bronze_row(f"2022-03-01T{h:02d}:00:00", 1, 10.0, 100, 2.0)
+        for h in range(10)
+    ]
+    rows.append(_bronze_row("2022-03-01T23:00:00", 1, 10.0, 100, 500.0))
+
+    outliers = extract_outliers(_make_bronze_df(spark, rows)).collect()
+
+    assert len(outliers) == 1
+    assert outliers[0].power_output == 500.0
+    assert outliers[0].turbine_mean_power > 2.0
+    assert outliers[0].turbine_stddev_power > 0.0
+
+
+def test_every_reading_lands_in_exactly_one_of_cleaned_or_outliers(spark):
+    rows = [
+        _bronze_row(f"2022-03-01T{h:02d}:00:00", 1, 10.0, 100, 2.0)
+        for h in range(10)
+    ]
+    rows.append(_bronze_row("2022-03-01T23:00:00", 1, 10.0, 100, 500.0))
+    bronze = _make_bronze_df(spark, rows)
+
+    cleaned_ts = {r.timestamp for r in clean_turbine_data(bronze).collect()}
+    outlier_ts = {r.timestamp for r in extract_outliers(bronze).collect()}
+
+    assert cleaned_ts.isdisjoint(outlier_ts)
+    assert len(cleaned_ts | outlier_ts) == 11

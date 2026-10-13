@@ -13,7 +13,8 @@ Medallion architecture, one file per table:
 transformations/
   bronze/turbine_raw.py        Auto Loader ingest of the raw CSVs, CDC-merged;
                                rows missing a key go to turbine_raw_quarantine
-  silver/turbine_cleaned.py    dedup, missing-value imputation, outlier removal
+  silver/turbine_cleaned.py    dedup, missing-value imputation; outliers go
+                               to turbine_power_outliers
   gold/turbine_daily_stats.py  per-turbine, per-day min/max/avg/stddev
   gold/turbine_anomalies.py    per-turbine, per-day anomaly flag
 ```
@@ -27,7 +28,8 @@ deployed.
 Each transformation file separates **pure logic** from the Databricks
 pipeline glue:
 
-- `clean_turbine_data(raw_df)`, `compute_daily_stats(cleaned_df)`,
+- `clean_turbine_data(raw_df)`, `extract_outliers(raw_df)`,
+  `compute_daily_stats(cleaned_df)`,
   `detect_anomalies(daily_stats_df)` are plain functions of a DataFrame to a
   DataFrame - no dependency on Databricks-only APIs.
 - The `@dp.materialized_view`-decorated function in each Silver/Gold file is
@@ -75,9 +77,15 @@ bad rows don't duplicate either.
   (`@dp.expect_or_drop`) rather than imputed, since it's the primary
   measurement being reported on and a made-up value could hide a real
   sensor fault.
-- `power_output` outliers are removed per turbine using a 3-sigma rule
+- `power_output` outliers are identified per turbine using a 3-sigma rule
   (fixed 3 standard deviations from that turbine's own mean, distinct from
-  the 2-standard-deviation rule used for anomaly detection below).
+  the 2-standard-deviation rule used for anomaly detection below). They're
+  kept out of `turbine_cleaned` but not discarded: they're stored in
+  `colibri_assessment.silver.turbine_power_outliers` alongside the
+  turbine mean/stddev they were judged against, so they can be reviewed
+  (e.g. to tell a sensor glitch from a real fault). Both tables are
+  defined in `turbine_cleaned.py` because they share the same flagging
+  step (`flag_turbine_data`).
 - Each row gets a `quality_score` (1.0 = no imputation needed, 0.8 = one or
   both wind sensors imputed) that rolls up into the daily stats.
 

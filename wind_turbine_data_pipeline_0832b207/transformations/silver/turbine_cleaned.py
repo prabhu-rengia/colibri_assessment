@@ -2,9 +2,11 @@ from pyspark import pipelines as dp
 from pyspark.sql import functions as F, DataFrame
 
 
-def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
+def flag_turbine_data(raw_df: DataFrame) -> DataFrame:
     """
-    Silver layer transformation: clean and standardize raw turbine data.
+    Shared Silver preparation for clean_turbine_data and extract_outliers:
+    clean and standardize raw turbine data, flagging (not removing)
+    power_output outliers.
 
     Pure function of a bronze-shaped DataFrame (columns: timestamp,
     turbine_id, wind_speed, wind_direction, power_output, plus optional
@@ -19,7 +21,10 @@ def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
       median (power_output nulls are dropped upstream via
       @dp.expect_or_drop, since there's no sound way to impute the primary
       measurement being reported on).
-    - Remove power_output outliers using a per-turbine 3-sigma rule.
+    - Flag power_output outliers (is_outlier) using a per-turbine 3-sigma
+      rule, keeping the turbine's mean/stddev alongside for context.
+      is_outlier is null where power_output is null, so those rows are
+      excluded by both the outlier and non-outlier filters downstream.
     - Stamp _ingestion_time with the time this row was processed by Silver,
       overwriting the value carried in from Bronze - each layer records its
       own audit timestamp rather than propagating the original one.
@@ -62,9 +67,6 @@ def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
         (F.col("power_output") < F.col("mean_p") - 3 * F.col("std_p"))
     )
 
-    # Remove outliers
-    df = df.filter(~F.col("is_outlier"))
-
     # Calculate data quality score
     df = df.withColumn("quality_score",
         F.when(~F.col("missing_wind_speed") & ~F.col("missing_wind_direction"), 1.0)
@@ -73,12 +75,35 @@ def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
     )
 
     # Audit column: overwrite Bronze's _ingestion_time with Silver's own
-    df = df.withColumn("_ingestion_time", F.current_timestamp())
+    return df.withColumn("_ingestion_time", F.current_timestamp())
 
-    # Select final columns
-    return df.select(
+
+def clean_turbine_data(raw_df: DataFrame) -> DataFrame:
+    """
+    Silver layer transformation: the rows of flag_turbine_data that aren't
+    power_output outliers. The outliers go to extract_outliers instead.
+    """
+    df = flag_turbine_data(raw_df)
+    return df.filter(~F.col("is_outlier")).select(
         "timestamp", "date", "turbine_id", "wind_speed", "wind_direction",
         "power_output", "quality_score", "missing_wind_speed", "missing_wind_direction",
+        "_source_file", "_ingestion_time"
+    )
+
+
+def extract_outliers(raw_df: DataFrame) -> DataFrame:
+    """
+    Silver layer transformation: the power_output outliers excluded from
+    clean_turbine_data, with the per-turbine mean/stddev they were judged
+    against.
+    """
+    df = flag_turbine_data(raw_df)
+    return df.filter(F.col("is_outlier")).select(
+        "timestamp", "date", "turbine_id", "wind_speed", "wind_direction",
+        "power_output",
+        F.col("mean_p").alias("turbine_mean_power"),
+        F.col("std_p").alias("turbine_stddev_power"),
+        "quality_score", "missing_wind_speed", "missing_wind_direction",
         "_source_file", "_ingestion_time"
     )
 
@@ -95,3 +120,18 @@ def turbine_cleaned():
     """Silver layer: Databricks pipeline entry point, delegates to clean_turbine_data."""
     raw_df = spark.read.table("colibri_assessment.bronze.turbine_raw")
     return clean_turbine_data(raw_df)
+
+
+# Defined here rather than in its own file because it shares
+# flag_turbine_data with turbine_cleaned: importing this module from another
+# pipeline source file would register turbine_cleaned a second time.
+@dp.materialized_view(
+    name="colibri_assessment.silver.turbine_power_outliers",
+    comment="power_output readings excluded from turbine_cleaned as per-turbine 3-sigma outliers",
+    table_properties={"quality": "silver"},
+    cluster_by=["turbine_id", "date"]
+)
+def turbine_power_outliers():
+    """Silver layer: Databricks pipeline entry point, delegates to extract_outliers."""
+    raw_df = spark.read.table("colibri_assessment.bronze.turbine_raw")
+    return extract_outliers(raw_df)

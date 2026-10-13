@@ -11,7 +11,8 @@ Medallion architecture, one file per table:
 
 ```
 transformations/
-  bronze/turbine_raw.py        Auto Loader ingest of the raw CSVs, CDC-merged
+  bronze/turbine_raw.py        Auto Loader ingest of the raw CSVs, CDC-merged;
+                               rows missing a key go to turbine_raw_quarantine
   silver/turbine_cleaned.py    dedup, missing-value imputation, outlier removal
   gold/turbine_daily_stats.py  per-turbine, per-day min/max/avg/stddev
   gold/turbine_anomalies.py    per-turbine, per-day anomaly flag
@@ -54,6 +55,16 @@ volume still grows the same way bronze storage used to - the CDC upsert
 just discards the resulting duplicates on write instead of persisting them.
 Acceptable at this data volume; would need revisiting for large per-file
 sizes.
+
+Rows missing `turbine_id` and/or `timestamp` (e.g. a malformed CSV line,
+which Auto Loader's PERMISSIVE mode keeps with nulls rather than dropping)
+can't be merged on those keys, and a null timestamp would fail Silver's
+`expect_or_fail`. They're routed instead to
+`colibri_assessment.bronze.turbine_raw_quarantine`, with a
+`_quarantine_reason` column and any unparseable values preserved in
+`_rescued_data`. The quarantine table is CDC-merged too, keyed on
+`(_source_file, _row_hash)` - a hash of the row's contents - so re-emitted
+bad rows don't duplicate either.
 
 ### Cleaning (Silver)
 
